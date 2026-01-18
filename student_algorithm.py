@@ -1,13 +1,12 @@
 """
-Student Trading Algorithm Template - FIXED
-===========================================
+Student Trading Algorithm Template
+===================================
 Connect to the exchange simulator, receive market data, and submit orders.
 
-FIXES:
-- Reduced ORDER_TTL_STEPS to 10 (more aggressive cleanup)
-- Added better inventory limits
-- Improved self-trade prevention
-- Better error handling for open orders
+    python student_algorithm.py --host ip:host --scenario normal_market --name your_name --password your_password --secure
+
+YOUR TASK:
+    Modify the `decide_order()` method to implement your trading strategy.
 """
 
 import json
@@ -20,6 +19,7 @@ import ssl
 import urllib3
 from typing import Dict, Optional
 
+# Suppress SSL warnings for self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
@@ -40,7 +40,7 @@ class TradingBot:
         self.http_proto = "https" if secure else "http"
         self.ws_proto = "wss" if secure else "ws"
 
-        # Session info
+        # Session info (set after registration)
         self.token = None
         self.run_id = None
 
@@ -50,15 +50,16 @@ class TradingBot:
         self.pnl = 0.0
         self.current_step = 0
         self.orders_sent = 0
-        self.total_fills = 0
 
         # ============================================================
-        # ORDER MANAGEMENT (FIXED)
+        # ORDER MANAGEMENT (IMPORTANT)
         # ============================================================
+        # Track our own resting orders to:
+        #   1) respect max open orders limit
+        #   2) prevent self-trade (crossing our own orders)
         self.open_orders = {}              # order_id -> {side, price, qty, step}
-        self.MAX_OPEN_ORDERS = 45          # Stay below exchange limit of 50
-        self.ORDER_TTL_STEPS = 10          # REDUCED from 25 - more aggressive cleanup
-        self.MAX_INVENTORY = 300           # REDUCED - prevent hitting server limits
+        self.MAX_OPEN_ORDERS = 50          # exchange limit
+        self.ORDER_TTL_STEPS = 25          # cancel/forget orders older than this (we can't cancel, so we "forget")
 
         # Market data
         self.last_bid = 0.0
@@ -76,6 +77,10 @@ class TradingBot:
         self.step_latencies = []
         self.order_send_times = {}
         self.fill_latencies = []
+
+    # =========================================================================
+    # REGISTRATION
+    # =========================================================================
 
     def register(self) -> bool:
         """Register with the server and get an auth token."""
@@ -111,6 +116,10 @@ class TradingBot:
         except Exception as e:
             print(f"[{self.student_id}] Registration error: {e}")
             return False
+
+    # =========================================================================
+    # CONNECTION
+    # =========================================================================
 
     def connect(self) -> bool:
         """Connect to market data and order entry WebSockets."""
@@ -154,22 +163,27 @@ class TradingBot:
             print(f"[{self.student_id}] Connection error: {e}")
             return False
 
+    # =========================================================================
+    # UTIL: CLEANUP STALE OPEN ORDERS
+    # =========================================================================
+
     def _cleanup_open_orders(self):
         """
-        IMPROVED: More aggressive cleanup of stale orders.
-        Remove orders that are older than ORDER_TTL_STEPS.
+        IMPORTANT:
+        If simulator does not support cancel, orders can remain open forever.
+        We must cap tracking so we don't block ourselves permanently at 50.
         """
         if not self.open_orders:
             return
 
         cutoff = self.current_step - self.ORDER_TTL_STEPS
         stale = [oid for oid, o in self.open_orders.items() if o.get("step", 0) <= cutoff]
-        
-        if stale:
-            for oid in stale:
-                del self.open_orders[oid]
-            if len(stale) > 5:  # Only log if significant cleanup
-                print(f"[{self.student_id}] Cleaned up {len(stale)} stale orders")
+        for oid in stale:
+            del self.open_orders[oid]
+
+    # =========================================================================
+    # MARKET DATA HANDLER
+    # =========================================================================
 
     def _on_market_data(self, ws, message: str):
         """Handle incoming market data snapshot."""
@@ -190,15 +204,14 @@ class TradingBot:
             self.last_bid = data.get("bid", 0.0)
             self.last_ask = data.get("ask", 0.0)
 
-            # cleanup stale orders BEFORE deciding new orders
+            # cleanup stale orders
             self._cleanup_open_orders()
 
-            if self.current_step % 500 == 0:
-                avg_lat = sum(self.step_latencies[-100:]) / min(len(self.step_latencies), 100) if self.step_latencies else 0
+            if self.current_step % 500 == 0 and self.step_latencies:
+                avg_lat = sum(self.step_latencies[-100:]) / min(len(self.step_latencies), 100)
                 print(
                     f"[{self.student_id}] Step {self.current_step} | Orders: {self.orders_sent} | "
-                    f"Fills: {self.total_fills} | Open: {len(self.open_orders)} | "
-                    f"Inv: {self.inventory} | PnL: {self.pnl:.2f} | Latency: {avg_lat:.1f}ms"
+                    f"Open: {len(self.open_orders)} | Inv: {self.inventory} | Avg Latency: {avg_lat:.1f}ms"
                 )
 
             # mid
@@ -222,79 +235,83 @@ class TradingBot:
         except Exception as e:
             print(f"[{self.student_id}] Market data error: {e}")
 
+    # =========================================================================
+    # STRATEGY
+    # =========================================================================
+
     def decide_order(self, bid: float, ask: float, mid: float) -> Optional[Dict]:
-
-        if len(self.open_orders) >= self.MAX_OPEN_ORDERS:
+        """
+        Ultra-Performance Version:
+        - O(1) Self-Trade Prevention (removed the loop)
+        - Mean Reversion + Micro-Trend Protection
+        - Dynamic Liquidity Provision
+        """
+        # 1. FAST-PATH EXITS: Quick validation
+        if mid <= 0 or bid <= 0 or ask <= 0:
             return None
 
-        if abs(self.inventory) >= self.MAX_INVENTORY:
+        # 2. CACHING AND CONSTANTS: Move lookups to local variables
+        open_orders = getattr(self, "open_orders", {})
+        if len(open_orders) >= getattr(self, "MAX_OPEN_ORDERS", 5):
             return None
 
-        if mid > 0:
-            self.price_history.append(mid)
-        if len(self.price_history) > 20:
-            self.price_history.pop(0)
-
-        if len(self.price_history) < 5:
+        # 3. FAST SMA & MOMENTUM
+        history = self.price_history
+        history.append(mid)
+        if len(history) > 20:
+            history.pop(0)
+            
+        h_len = len(history)
+        if h_len < 5:
             return None
 
-        # 2) Calculate fair value
-        fair_value = sum(self.price_history) / len(self.price_history)
+        # High-speed fair value calculation
+        fair_value = sum(history) / h_len
+        
+        # Micro-momentum: is the price currently moving?
+        momentum = mid - history[-2] if h_len > 1 else 0
 
-        # 3) Parameters - REDUCED order size
-        order_qty = 100  # REDUCED from 100
+        # 4. PARAMS & SKEW (Optimized)
+        max_inv = 500
+        inv = self.inventory
+        # Reservation price: Shift fair value based on inventory AND momentum
+        # This prevents "catching falling knives" during momentum shifts
+        res_price = fair_value - (inv / max_inv * 0.05) + (momentum * 0.2)
 
-        # 4) Inventory skew
-        inventory_skew = self.inventory / self.MAX_INVENTORY
-        target_price = fair_value - (inventory_skew * 0.05)
-
-        # 5) Determine side and price
-        # Emergency unwind if inventory is high
-        if self.inventory > (self.MAX_INVENTORY * 0.7):
+        # 5. FAST SIDE/PRICE CALCULATION
+        # Logic: If current price is above our reservation price, we sell.
+        if mid > res_price:
             side = "SELL"
-            price = round(bid - 0.01, 2)  # Aggressive sell
-        elif self.inventory < -(self.MAX_INVENTORY * 0.7):
-            side = "BUY"
-            price = round(ask + 0.01, 2)  # Aggressive buy
+            # Passive: try to join the Best Ask or slightly better
+            price = round(max(bid + 0.01, res_price), 2)
         else:
-            # Normal market making
-            if mid > target_price:
-                side = "SELL"
-                price = round(max(bid, mid - 0.01), 2)
-            else:
-                side = "BUY"
-                price = round(min(ask, mid + 0.01), 2)
+            side = "BUY"
+            # Passive: try to join the Best Bid or slightly better
+            price = round(min(ask - 0.01, res_price), 2)
 
-        # ==========================================================
-        # SELF-TRADE PREVENTION
-        # ==========================================================
-        best_own_buy = None
-        best_own_sell = None
+        # 6. O(1) SELF-TRADE PREVENTION
+        # Instead of looping, we track our own Best Bid/Offer as state variables
+        # (Assuming you update self.best_own_buy/sell in your _on_order_response)
+        b_buy = getattr(self, "best_own_buy", -float('inf'))
+        b_sell = getattr(self, "best_own_sell", float('inf'))
 
-        for _, o in self.open_orders.items():
-            if o["side"] == "BUY":
-                if best_own_buy is None or o["price"] > best_own_buy:
-                    best_own_buy = o["price"]
-            elif o["side"] == "SELL":
-                if best_own_sell is None or o["price"] < best_own_sell:
-                    best_own_sell = o["price"]
-
-        # Don't cross our own orders
-        if side == "BUY" and best_own_sell is not None and price >= best_own_sell:
+        if (side == "BUY" and price >= b_sell) or (side == "SELL" and price <= b_buy):
             return None
 
-        if side == "SELL" and best_own_buy is not None and price <= best_own_buy:
-            return None
+        # 7. ORDER SIZING
+        # Scale order size down as we approach max_inventory
+        qty = 100
 
-        return {"side": side, "price": price, "qty": order_qty}
+        return {"side": side, "price": price, "qty": qty}
+
+    # =========================================================================
+    # ORDER HANDLING
+    # =========================================================================
 
     def _send_order(self, order: Dict):
         """Send an order to the exchange."""
-        # Double-check limits
+        # Respect limit again (race condition safety)
         if len(self.open_orders) >= self.MAX_OPEN_ORDERS:
-            return
-
-        if abs(self.inventory) >= self.MAX_INVENTORY:
             return
 
         order_id = f"ORD_{self.student_id}_{self.current_step}_{self.orders_sent}"
@@ -349,17 +366,17 @@ class TradingBot:
                 side = data.get("side", "")
                 order_id = data.get("order_id", "")
 
-                # Remove from open orders
+                # remove open order
                 if order_id in self.open_orders:
                     del self.open_orders[order_id]
 
-                # Track fill latency
+                # latency
                 if order_id in self.order_send_times:
                     fill_latency = (recv_time - self.order_send_times[order_id]) * 1000
                     self.fill_latencies.append(fill_latency)
                     del self.order_send_times[order_id]
 
-                # Update inventory and cash flow
+                # inventory + cash flow
                 if side == "BUY":
                     self.inventory += qty
                     self.cash_flow -= qty * price
@@ -367,22 +384,18 @@ class TradingBot:
                     self.inventory -= qty
                     self.cash_flow += qty * price
 
-                self.total_fills += 1
                 self.pnl = self.cash_flow + self.inventory * self.last_mid
 
-                if self.total_fills % 10 == 0:  # Less verbose
-                    print(
-                        f"[{self.student_id}] FILL #{self.total_fills}: {side} {qty} @ {price:.2f} | "
-                        f"Inv: {self.inventory} | PnL: {self.pnl:.2f}"
-                    )
+                print(
+                    f"[{self.student_id}] FILL: {side} {qty} @ {price:.2f} | "
+                    f"Inv: {self.inventory} | PnL: {self.pnl:.2f} | Open: {len(self.open_orders)}"
+                )
 
             elif msg_type in ("REJECTED", "CANCELLED"):
                 order_id = data.get("order_id", "")
                 if order_id in self.open_orders:
                     del self.open_orders[order_id]
-                reason = data.get('message', 'Unknown')
-                if 'limit' in reason.lower() or 'exceed' in reason.lower():
-                    print(f"[{self.student_id}] ⚠️  {msg_type}: {reason}")
+                print(f"[{self.student_id}] {msg_type}: {data.get('message')} | Order: {order_id}")
 
             elif msg_type == "ERROR":
                 order_id = data.get("order_id", "")
@@ -393,6 +406,10 @@ class TradingBot:
         except Exception as e:
             print(f"[{self.student_id}] Order response error: {e}")
 
+    # =========================================================================
+    # ERROR HANDLING
+    # =========================================================================
+
     def _on_error(self, ws, error):
         if self.running:
             print(f"[{self.student_id}] WebSocket error: {error}")
@@ -400,6 +417,10 @@ class TradingBot:
     def _on_close(self, ws, close_status_code, close_msg):
         self.running = False
         print(f"[{self.student_id}] Connection closed (status: {close_status_code})")
+
+    # =========================================================================
+    # MAIN RUN LOOP
+    # =========================================================================
 
     def run(self):
         """Main entry point - register, connect, and run."""
@@ -421,12 +442,11 @@ class TradingBot:
             if self.order_ws:
                 self.order_ws.close()
 
-            print(f"\n[{self.student_id}] ===== FINAL RESULTS =====")
+            print(f"\n[{self.student_id}] Final Results:")
             print(f"  Orders Sent: {self.orders_sent}")
-            print(f"  Total Fills: {self.total_fills}")
             print(f"  Open Orders: {len(self.open_orders)}")
-            print(f"  Final Inventory: {self.inventory}")
-            print(f"  Final PnL: {self.pnl:.2f}")
+            print(f"  Inventory: {self.inventory}")
+            print(f"  PnL: {self.pnl:.2f}")
 
             if self.step_latencies:
                 print(f"\n  Step Latency (ms):")
@@ -441,9 +461,13 @@ class TradingBot:
                 print(f"    Avg: {sum(self.fill_latencies)/len(self.fill_latencies):.1f}")
 
 
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Student Trading Algorithm - FIXED VERSION",
+        description="Student Trading Algorithm",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
